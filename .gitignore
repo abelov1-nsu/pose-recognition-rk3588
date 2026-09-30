@@ -1,0 +1,114 @@
+# ==========================================
+# Python
+# ==========================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ==========================================
+# IDE / Editor
+# ==========================================
+
+.vscode/
+.idea/
+*.code-workspace
+
+# ==========================================
+# OS
+# ==========================================
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# ==========================================
+# Python tooling / caches
+# ==========================================
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==========================================
+# Project-generated datasets
+# ==========================================
+
+# Raw recorded videos
+dataset/raw/
+
+# Extracted keypoints
+dataset/keypoints/
+
+# ==========================================
+# Trained/generated models
+# ==========================================
+
+# Generated classifier
+# *.joblib
+
+# YOLO weights
+# *.pt
+
+# RKNN models
+*.rknn
+
+# ONNX exports
+*.onnx
+
+# TensorRT / other generated model formats
+*.engine
+
+# ==========================================
+# Generated results
+# ==========================================
+
+results/
+output/
+outputs/
+
+# Annotated videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# ==========================================
+# Temporary files
+# ==========================================
+
+*.tmp
+*.temp
+*.log
+
+# ==========================================
+# Jupyter
+# ==========================================
+
+.ipynb_checkpoints/
+
+# ==========================================
+# Secrets / local configuration
+# ==========================================
+
+.env
+.env.*
+!.env.example

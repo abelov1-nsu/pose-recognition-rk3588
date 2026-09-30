@@ -1,0 +1,7 @@
+numpy
+opencv-python
+ultralytics
+scikit-learn
+joblib
+tqdm
+mss
