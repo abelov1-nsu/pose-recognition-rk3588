@@ -18,6 +18,7 @@ CLASSES = [
     "smoking",
     "combat",
     "other",
+    "67"
 ]
 
 BASE_DIR = "dataset/raw"

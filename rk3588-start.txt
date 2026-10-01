@@ -1,0 +1,55 @@
+Quickstart
+1. Python environment
+
+The project uses Python 3.10.
+
+If .venv does not exist:
+
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+Check:
+
+python --version
+
+Expected:
+
+Python 3.10.x
+
+Install dependencies:
+
+pip install -r requirements.txt
+2. Project pipeline
+pose_test.py  → test YOLO
+collect.py    → record dataset
+extract.py    → extract poses
+train.py      → train classifier
+recognize.py  → recognize poses
+
+Run the complete training pipeline:
+
+python extract.py
+python train.py
+python recognize.py
+
+Or:
+
+python extract.py; python train.py; python recognize.py
+3. Sources
+
+Webcam:
+
+python recognize.py
+
+Video:
+
+python recognize.py --source video.mp4
+
+Screen:
+
+python recognize.py --source screen
+
+For screen capture, physical monitors use numbers starting from 1.
+Monitor 0 is the combined virtual desktop and is not used.
+
+При этом сам классификатор может остаться маленьким CPU-модулем, а тяжёлый YOLO pose будет работать на NPU. Это хорошо соответствует нашей цели для RK3588.
