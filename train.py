@@ -1,469 +1,792 @@
-import os
+"""
+train.py
+
+Train a temporal GRU classifier on pose sequences.
+
+Pipeline:
+
+    dataset/keypoints/<class>/<recording>.npy
+                    ↓
+             temporal windows
+                    ↓
+             15 × 85 features
+                    ↓
+                  GRU
+                    ↓
+              class prediction
+
+Important:
+    Recordings are split into train/validation BEFORE windows are created.
+    This prevents windows from the same recording appearing in both sets.
+"""
+
+from __future__ import annotations
+
+import random
+from pathlib import Path
+
 import numpy as np
-import joblib
+import torch
+import torch.nn as nn
+from sklearn.metrics import classification_report, confusion_matrix
+from torch.utils.data import DataLoader, Dataset
 
-from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from temporal_features import (
+    FEATURES_PER_FRAME,
+    SAMPLE_RATE,
+    SEQUENCE_LENGTH,
+    build_temporal_features,
+)
 
 
 # ============================================================
-# CONFIGURATION
+# Configuration
 # ============================================================
 
-DATASET_DIR = "dataset/keypoints"
-OUTPUT_MODEL = "pose_classifier.joblib"
+KEYPOINT_DIR = Path("dataset/keypoints")
+MODEL_PATH = Path("pose_sequence_model.pt")
 
-CLASSES = [
-    "tpose",
-    "bored",
-    "smoking",
-    "combat",
-    "other"
-]
+VAL_SPLIT = 0.20
 
-# Take every Nth frame from each recording.
-FRAME_STEP = 5
+BATCH_SIZE = 64
+EPOCHS = 40
 
-# Training augmentation
-USE_MIRROR_AUGMENTATION = True
-USE_STRETCH_AUGMENTATION = True
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
 
-# Number of mildly stretched versions generated per frame.
-NUM_STRETCH_VARIANTS = 1
+HIDDEN_SIZE = 64
+NUM_LAYERS = 1
 
-# Maximum amount of horizontal / vertical deformation.
-#
-# Example:
-#   0.05 means the dimension can be scaled between
-#   0.95 and 1.05.
-STRETCH_AMOUNT = 0.05
+WINDOW_SECONDS = 1.0
+WINDOW_FRAMES = 30
 
-# Random seed for reproducibility.
+WINDOW_STRIDE = 8
+
 RANDOM_SEED = 42
 
-
-# ============================================================
-# COCO KEYPOINT MIRRORING
-# ============================================================
-
-# COCO 17-keypoint indices:
-#
-# 0  nose
-# 1  left eye
-# 2  right eye
-# 3  left ear
-# 4  right ear
-# 5  left shoulder
-# 6  right shoulder
-# 7  left elbow
-# 8  right elbow
-# 9  left wrist
-# 10 right wrist
-# 11 left hip
-# 12 right hip
-# 13 left knee
-# 14 right knee
-# 15 left ankle
-# 16 right ankle
-
-LEFT_RIGHT_PAIRS = [
-    (1, 2),    # eyes
-    (3, 4),    # ears
-    (5, 6),    # shoulders
-    (7, 8),    # elbows
-    (9, 10),   # wrists
-    (11, 12),  # hips
-    (13, 14),  # knees
-    (15, 16),  # ankles
-]
+NUM_WORKERS = 0
 
 
 # ============================================================
-# AUGMENTATION
+# Reproducibility
 # ============================================================
 
-def mirror_pose(frame):
+def set_seed(seed: int = RANDOM_SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# Model
+# ============================================================
+
+class PoseSequenceGRU(nn.Module):
     """
-    Create a left-right mirrored version of a normalized pose.
+    Small GRU for temporal pose classification.
 
     Input:
-        (17, 3)
+        (batch, sequence_length, 85)
 
     Output:
-        (17, 3)
-
-    The X coordinate is negated and all left/right keypoints
-    are swapped.
+        (batch, num_classes)
     """
 
-    mirrored = frame.copy()
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_classes: int,
+        num_layers: int = 1,
+    ):
+        super().__init__()
 
-    # Mirror horizontally.
-    mirrored[:, 0] *= -1
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+        )
 
-    # Swap left/right anatomical keypoints.
-    for left, right in LEFT_RIGHT_PAIRS:
-        mirrored[[left, right]] = mirrored[[right, left]]
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, num_classes),
+        )
 
-    return mirrored
+    def forward(self, x):
+        output, _ = self.gru(x)
 
+        # Last timestep
+        last_output = output[:, -1, :]
 
-def stretch_pose(frame, rng):
-    """
-    Apply a small independent horizontal/vertical stretch.
-
-    This simulates mild differences in camera geometry,
-    person proportions, and pose estimation.
-
-    The transformation is performed around the normalized
-    shoulder center (approximately x=0, y=0).
-
-    Confidence values are unchanged.
-    """
-
-    augmented = frame.copy()
-
-    x_scale = rng.uniform(
-        1.0 - STRETCH_AMOUNT,
-        1.0 + STRETCH_AMOUNT
-    )
-
-    y_scale = rng.uniform(
-        1.0 - STRETCH_AMOUNT,
-        1.0 + STRETCH_AMOUNT
-    )
-
-    augmented[:, 0] *= x_scale
-    augmented[:, 1] *= y_scale
-
-    return augmented
+        return self.classifier(last_output)
 
 
 # ============================================================
-# LOAD RECORDINGS
+# Dataset
 # ============================================================
 
-def get_recordings():
+class TemporalPoseDataset(Dataset):
+
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+
+        features, label = self.samples[index]
+
+        return (
+            torch.from_numpy(features).float(),
+            torch.tensor(label, dtype=torch.long),
+        )
+
+
+# ============================================================
+# Discover classes
+# ============================================================
+
+def discover_classes():
+    if not KEYPOINT_DIR.exists():
+        raise FileNotFoundError(
+            f"Keypoint directory does not exist:\n{KEYPOINT_DIR}"
+        )
+
+    classes = sorted(
+        path.name
+        for path in KEYPOINT_DIR.iterdir()
+        if path.is_dir()
+    )
+
+    if not classes:
+        raise RuntimeError(
+            f"No class directories found in {KEYPOINT_DIR}"
+        )
+
+    return classes
+
+
+# ============================================================
+# Discover recordings
+# ============================================================
+
+def discover_recordings(classes):
 
     recordings = []
 
-    for label, cls in enumerate(CLASSES):
+    for class_index, class_name in enumerate(classes):
 
-        folder = os.path.join(
-            DATASET_DIR,
-            cls
-        )
+        class_dir = KEYPOINT_DIR / class_name
 
-        if not os.path.isdir(folder):
-            print("WARNING: Missing folder:", folder)
-            continue
+        files = sorted(class_dir.glob("*.npy"))
 
-        files = sorted(
-            f for f in os.listdir(folder)
-            if f.endswith(".npy")
-        )
-
-        for file in files:
-
-            path = os.path.join(
-                folder,
-                file
+        if not files:
+            print(
+                f"Warning: no .npy files found for class '{class_name}'"
             )
+
+        for path in files:
 
             recordings.append(
                 {
                     "path": path,
-                    "label": label,
-                    "class": cls,
-                    "file": file
+                    "label": class_index,
+                    "class_name": class_name,
                 }
             )
+
+    if not recordings:
+        raise RuntimeError(
+            "No keypoint recordings were found."
+        )
 
     return recordings
 
 
 # ============================================================
-# LOAD FRAMES FROM RECORDINGS
+# File-level train/validation split
 # ============================================================
 
-def load_frames(recordings):
+def split_recordings(recordings, val_split=VAL_SPLIT):
 
-    X = []
-    y = []
+    by_class = {}
 
     for recording in recordings:
-
-        data = np.load(
-            recording["path"]
-        )
-
-        # Take every 5th frame.
-        samples = data[::FRAME_STEP]
-
-        for frame in samples:
-
-            X.append(
-                frame.flatten()
-            )
-
-            y.append(
-                recording["label"]
-            )
-
-    if not X:
-        return (
-            np.empty((0, 51), dtype=np.float32),
-            np.empty((0,), dtype=np.int64)
-        )
-
-    return (
-        np.asarray(X, dtype=np.float32),
-        np.asarray(y, dtype=np.int64)
-    )
-
-
-# ============================================================
-# AUGMENT TRAINING DATA
-# ============================================================
-
-def augment_recordings(recordings, rng):
-
-    X = []
-    y = []
-
-    for recording in recordings:
-
-        data = np.load(
-            recording["path"]
-        )
-
-        samples = data[::FRAME_STEP]
 
         label = recording["label"]
 
-        for frame in samples:
+        by_class.setdefault(label, []).append(recording)
 
-            # ------------------------------------------------
-            # Original
-            # ------------------------------------------------
+    train_recordings = []
+    val_recordings = []
 
-            X.append(
-                frame.flatten()
+    rng = random.Random(RANDOM_SEED)
+
+    for label, items in by_class.items():
+
+        items = items.copy()
+
+        rng.shuffle(items)
+
+        if len(items) == 1:
+            print(
+                f"Warning: class '{items[0]['class_name']}' "
+                f"has only one recording."
             )
 
-            y.append(label)
+            train_recordings.extend(items)
+            continue
 
-            # ------------------------------------------------
-            # Mirrored
-            # ------------------------------------------------
+        val_count = max(
+            1,
+            round(len(items) * val_split),
+        )
 
-            if USE_MIRROR_AUGMENTATION:
+        val_items = items[:val_count]
+        train_items = items[val_count:]
 
-                mirrored = mirror_pose(frame)
+        train_recordings.extend(train_items)
+        val_recordings.extend(val_items)
 
-                X.append(
-                    mirrored.flatten()
-                )
+    rng.shuffle(train_recordings)
+    rng.shuffle(val_recordings)
 
-                y.append(label)
+    return train_recordings, val_recordings
 
-            # ------------------------------------------------
-            # Mild stretching / compression
-            # ------------------------------------------------
 
-            if USE_STRETCH_AUGMENTATION:
+# ============================================================
+# Create temporal windows
+# ============================================================
 
-                for _ in range(NUM_STRETCH_VARIANTS):
+def recording_to_windows(recording):
 
-                    stretched = stretch_pose(
-                        frame,
-                        rng
-                    )
+    path = recording["path"]
+    label = recording["label"]
 
-                    X.append(
-                        stretched.flatten()
-                    )
+    poses = np.load(path)
 
-                    y.append(label)
+    if poses.ndim != 3 or poses.shape[1:] != (17, 3):
 
-    return (
-        np.asarray(X, dtype=np.float32),
-        np.asarray(y, dtype=np.int64)
+        print(
+            f"Skipping invalid file: {path}"
+        )
+
+        return []
+
+    num_frames = len(poses)
+
+    if num_frames < WINDOW_FRAMES:
+
+        # Very short recording:
+        # use the whole recording and let resampling
+        # expand it to the required sequence length.
+
+        feature_sequence = build_temporal_features(
+            poses,
+            target_length=SEQUENCE_LENGTH,
+            sample_rate=SAMPLE_RATE,
+        )
+
+        return [
+            (
+                feature_sequence.astype(np.float32),
+                label,
+            )
+        ]
+
+    samples = []
+
+    for start in range(
+        0,
+        num_frames - WINDOW_FRAMES + 1,
+        WINDOW_STRIDE,
+    ):
+
+        end = start + WINDOW_FRAMES
+
+        window = poses[start:end]
+
+        features = build_temporal_features(
+            window,
+            target_length=SEQUENCE_LENGTH,
+            sample_rate=SAMPLE_RATE,
+        )
+
+        samples.append(
+            (
+                features.astype(np.float32),
+                label,
+            )
+        )
+
+    return samples
+
+
+def build_samples(recordings):
+
+    samples = []
+
+    for i, recording in enumerate(recordings, 1):
+
+        class_name = recording["class_name"]
+        path = recording["path"]
+
+        windows = recording_to_windows(recording)
+
+        samples.extend(windows)
+
+        print(
+            f"[{i}/{len(recordings)}] "
+            f"{class_name:10s} "
+            f"{path.name:30s} "
+            f"-> {len(windows):3d} windows"
+        )
+
+    return samples
+
+
+# ============================================================
+# Class weights
+# ============================================================
+
+def calculate_class_weights(samples, num_classes):
+
+    counts = np.zeros(num_classes, dtype=np.float32)
+
+    for _, label in samples:
+        counts[label] += 1
+
+    print()
+    print("Training window counts:")
+
+    for i, count in enumerate(counts):
+        print(f"  class {i}: {int(count)}")
+
+    total = counts.sum()
+
+    weights = np.zeros(num_classes, dtype=np.float32)
+
+    for i in range(num_classes):
+
+        if counts[i] > 0:
+            weights[i] = total / (
+                num_classes * counts[i]
+            )
+
+    return torch.tensor(
+        weights,
+        dtype=torch.float32,
     )
 
 
 # ============================================================
-# MAIN
+# Training
+# ============================================================
+
+def train_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device,
+):
+
+    model.train()
+
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for features, labels in loader:
+
+        features = features.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        logits = model(features)
+
+        loss = criterion(
+            logits,
+            labels,
+        )
+
+        loss.backward()
+
+        optimizer.step()
+
+        total_loss += (
+            loss.item() * labels.size(0)
+        )
+
+        predictions = logits.argmax(dim=1)
+
+        correct += (
+            predictions == labels
+        ).sum().item()
+
+        total += labels.size(0)
+
+    return (
+        total_loss / total,
+        correct / total,
+    )
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+def evaluate(
+    model,
+    loader,
+    criterion,
+    device,
+):
+
+    model.eval()
+
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    all_predictions = []
+    all_labels = []
+
+    with torch.no_grad():
+
+        for features, labels in loader:
+
+            features = features.to(device)
+            labels = labels.to(device)
+
+            logits = model(features)
+
+            loss = criterion(
+                logits,
+                labels,
+            )
+
+            total_loss += (
+                loss.item() * labels.size(0)
+            )
+
+            predictions = logits.argmax(dim=1)
+
+            correct += (
+                predictions == labels
+            ).sum().item()
+
+            total += labels.size(0)
+
+            all_predictions.extend(
+                predictions.cpu().numpy()
+            )
+
+            all_labels.extend(
+                labels.cpu().numpy()
+            )
+
+    return (
+        total_loss / total,
+        correct / total,
+        np.array(all_labels),
+        np.array(all_predictions),
+    )
+
+
+# ============================================================
+# Main
 # ============================================================
 
 def main():
 
-    rng = np.random.default_rng(
-        RANDOM_SEED
+    set_seed()
+
+    print()
+    print("======================================")
+    print("       TEMPORAL POSE TRAINER")
+    print("======================================")
+    print()
+
+    # --------------------------------------------------------
+    # Device
+    # --------------------------------------------------------
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
     )
 
+    print(f"Device: {device}")
+
     # --------------------------------------------------------
-    # Find recordings
+    # Classes
     # --------------------------------------------------------
 
-    recordings = get_recordings()
+    classes = discover_classes()
 
-    if not recordings:
-        print("ERROR: No .npy recordings found.")
-        return
+    print()
+    print("Classes:")
+
+    for i, class_name in enumerate(classes):
+        print(f"  {i}: {class_name}")
+
+    print()
+
+    # --------------------------------------------------------
+    # Recordings
+    # --------------------------------------------------------
+
+    recordings = discover_recordings(classes)
 
     print(
-        "Recordings:",
-        len(recordings)
+        f"Total recordings: {len(recordings)}"
     )
 
     # --------------------------------------------------------
-    # Print recording counts
+    # Split recordings
+    # --------------------------------------------------------
+
+    train_recordings, val_recordings = split_recordings(
+        recordings
+    )
+
+    print()
+    print(
+        f"Training recordings:   {len(train_recordings)}"
+    )
+
+    print(
+        f"Validation recordings: {len(val_recordings)}"
+    )
+
+    # --------------------------------------------------------
+    # Build temporal samples
     # --------------------------------------------------------
 
     print()
-    print("Recordings per class:")
+    print("Building training windows...")
+    print()
 
-    for cls in CLASSES:
+    train_samples = build_samples(
+        train_recordings
+    )
 
-        count = sum(
-            r["class"] == cls
-            for r in recordings
+    print()
+    print(
+        f"Training samples: {len(train_samples)}"
+    )
+
+    print()
+    print("Building validation windows...")
+    print()
+
+    val_samples = build_samples(
+        val_recordings
+    )
+
+    print()
+    print(
+        f"Validation samples: {len(val_samples)}"
+    )
+
+    if not train_samples:
+        raise RuntimeError(
+            "No training samples were created."
         )
 
-        print(
-            f"  {cls:8s}: {count}"
+    if not val_samples:
+        raise RuntimeError(
+            "No validation samples were created."
         )
 
     # --------------------------------------------------------
-    # Split by recording, NOT by frame.
-    #
-    # This prevents frames from the same recording appearing
-    # in both training and testing sets.
+    # Dataset / DataLoader
     # --------------------------------------------------------
 
-    labels = np.array([
-        r["label"]
-        for r in recordings
-    ])
-
-    train_recordings, test_recordings = train_test_split(
-        recordings,
-        test_size=0.2,
-        random_state=RANDOM_SEED,
-        stratify=labels
+    train_dataset = TemporalPoseDataset(
+        train_samples
     )
+
+    val_dataset = TemporalPoseDataset(
+        val_samples
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
+
+    model = PoseSequenceGRU(
+        input_size=FEATURES_PER_FRAME,
+        hidden_size=HIDDEN_SIZE,
+        num_classes=len(classes),
+        num_layers=NUM_LAYERS,
+    ).to(device)
 
     print()
-    print(
-        "Training recordings:",
-        len(train_recordings)
-    )
-
-    print(
-        "Testing recordings:",
-        len(test_recordings)
-    )
+    print("Model:")
+    print(model)
 
     # --------------------------------------------------------
-    # Build training dataset
-    #
-    # Augmentation happens ONLY here.
+    # Class weights
     # --------------------------------------------------------
 
-    print()
-    print("Preparing training data...")
+    class_weights = calculate_class_weights(
+        train_samples,
+        len(classes),
+    ).to(device)
 
-    X_train, y_train = augment_recordings(
-        train_recordings,
-        rng
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights
     )
 
-    # --------------------------------------------------------
-    # Build untouched test dataset
-    # --------------------------------------------------------
-
-    print("Preparing test data...")
-
-    X_test, y_test = load_frames(
-        test_recordings
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
     )
 
-    print()
-    print(
-        "Training samples:",
-        X_train.shape
-    )
-
-    print(
-        "Test samples:",
-        X_test.shape
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=5,
     )
 
     # --------------------------------------------------------
-    # Report augmentation
-    # --------------------------------------------------------
-
-    augmentation_multiplier = 1
-
-    if USE_MIRROR_AUGMENTATION:
-        augmentation_multiplier += 1
-
-    if USE_STRETCH_AUGMENTATION:
-        augmentation_multiplier += NUM_STRETCH_VARIANTS
-
-    print()
-    print(
-        "Approx. training augmentation multiplier:",
-        augmentation_multiplier
-    )
-
-    # --------------------------------------------------------
-    # Classifier
-    # --------------------------------------------------------
-
-    model = Pipeline([
-
-        (
-            "scale",
-            StandardScaler()
-        ),
-
-        (
-            "mlp",
-            MLPClassifier(
-                hidden_layer_sizes=(
-                    64,
-                    32
-                ),
-                max_iter=500,
-                random_state=RANDOM_SEED
-            )
-        )
-    ])
-
-    # --------------------------------------------------------
-    # Train
+    # Training
     # --------------------------------------------------------
 
     print()
     print("Training...")
+    print()
 
-    model.fit(
-        X_train,
-        y_train
+    best_val_accuracy = -1.0
+
+    for epoch in range(1, EPOCHS + 1):
+
+        train_loss, train_accuracy = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+        )
+
+        (
+            val_loss,
+            val_accuracy,
+            _,
+            _,
+        ) = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device,
+        )
+
+        scheduler.step(val_accuracy)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        print(
+            f"Epoch {epoch:02d}/{EPOCHS} | "
+            f"train loss {train_loss:.4f} | "
+            f"train acc {train_accuracy:.3f} | "
+            f"val loss {val_loss:.4f} | "
+            f"val acc {val_accuracy:.3f} | "
+            f"lr {current_lr:.6f}"
+        )
+
+        # Save best model
+        if val_accuracy > best_val_accuracy:
+
+            best_val_accuracy = val_accuracy
+
+            checkpoint = {
+                "model_state_dict": model.state_dict(),
+                "classes": classes,
+                "input_size": FEATURES_PER_FRAME,
+                "hidden_size": HIDDEN_SIZE,
+                "num_layers": NUM_LAYERS,
+                "sequence_length": SEQUENCE_LENGTH,
+                "sample_rate": SAMPLE_RATE,
+            }
+
+            torch.save(
+                checkpoint,
+                MODEL_PATH,
+            )
+
+            print(
+                f"  Saved best model -> {MODEL_PATH}"
+            )
+
+    # --------------------------------------------------------
+    # Load best model
+    # --------------------------------------------------------
+
+    checkpoint = torch.load(
+        MODEL_PATH,
+        map_location=device,
+    )
+
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
     )
 
     # --------------------------------------------------------
-    # Evaluate
+    # Final evaluation
     # --------------------------------------------------------
 
-    predictions = model.predict(
-        X_test
+    (
+        val_loss,
+        val_accuracy,
+        labels,
+        predictions,
+    ) = evaluate(
+        model,
+        val_loader,
+        criterion,
+        device,
+    )
+
+    print()
+    print("======================================")
+    print("       FINAL VALIDATION")
+    print("======================================")
+    print()
+
+    print(
+        f"Validation loss: {val_loss:.4f}"
+    )
+
+    print(
+        f"Validation accuracy: {val_accuracy:.3f}"
     )
 
     print()
@@ -472,33 +795,30 @@ def main():
 
     print(
         classification_report(
-            y_test,
+            labels,
             predictions,
-            target_names=CLASSES
+            labels=np.arange(len(classes)),
+            target_names=classes,
+            zero_division=0,
         )
     )
 
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
-
-    joblib.dump(
-        {
-            "model": model,
-            "classes": CLASSES
-        },
-        OUTPUT_MODEL
-    )
+    print("Confusion matrix:")
+    print()
 
     print(
-        "Saved:",
-        OUTPUT_MODEL
+        confusion_matrix(
+            labels,
+            predictions,
+            labels=np.arange(len(classes)),
+        )
     )
 
+    print()
+    print(f"Best validation accuracy: {best_val_accuracy:.3f}")
+    print(f"Saved: {MODEL_PATH}")
+    print()
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
