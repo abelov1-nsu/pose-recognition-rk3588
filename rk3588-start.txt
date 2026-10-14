@@ -18,7 +18,8 @@ Python 3.10.x
 
 Install dependencies:
 
-pip install -r requirements.txt
+pip install -r rk3588-requirements.txt
+
 2. Project pipeline
 pose_test.py  → test YOLO
 collect.py    → record dataset

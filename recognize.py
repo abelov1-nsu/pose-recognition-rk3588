@@ -83,7 +83,7 @@ WINDOW_SECONDS = 1.0
 
 # Maximum amount of pose history kept for each person.
 # This gives us some safety margin around the 1-second window.
-MAX_HISTORY_SECONDS = 2.0
+MAX_HISTORY_SECONDS = 3.0
 
 # Small amount of output smoothing.
 # This is NOT the main temporal recognition mechanism anymore.
@@ -91,7 +91,7 @@ OUTPUT_SMOOTHING = 3
 
 # Remove a tracked person's state after this much time
 # without seeing them.
-MAX_MISSING_SECONDS = 2.0
+MAX_MISSING_SECONDS = 3.0
 
 
 # ============================================================
@@ -661,6 +661,7 @@ def analyze_frame(
     classes,
     person_states,
     frame_timestamp,
+    source_fps,
 ):
     """
     Process one frame.
@@ -768,7 +769,7 @@ def analyze_frame(
                 max_history_seconds=(
                     MAX_HISTORY_SECONDS
                 ),
-                sample_fps=SAMPLE_RATE,
+                sample_fps=source_fps,
             )
 
         state = person_states[
@@ -1318,6 +1319,7 @@ def main():
                 classes,
                 person_states,
                 frame_timestamp,
+                fps,
             )
 
         # ----------------------------------------------------

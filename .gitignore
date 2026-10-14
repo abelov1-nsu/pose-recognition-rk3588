@@ -109,6 +109,9 @@ outputs/
 # Secrets / local configuration
 # ==========================================
 
+calib/*
+check/*
+archive
 .env
 .env.*
 !.env.example

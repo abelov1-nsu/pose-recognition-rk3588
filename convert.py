@@ -1,0 +1,108 @@
+import sys,os
+from rknn.api import RKNN
+
+DATASET_PATH = '../../../datasets/COCO/coco_subset_20.txt'
+DEFAULT_RKNN_PATH = '../model/yolov8_pose.rknn'
+DEFAULT_QUANT = True
+
+def parse_arg():
+    if len(sys.argv) < 3:
+        print("Usage: python3 {} onnx_model_path [platform] [dtype(optional)] [output_rknn_path(optional)]".format(sys.argv[0]));
+        print("       platform choose from [rk3562, rk3566, rk3568, rk3576, rk3588, rv1126b]")
+        print("       dtype choose from [i8] for [rk3562, rk3566, rk3568, rk3576, rk3588, rv1126b]")
+        print("       hybrid-quant step choose from [1,2] for i8 for [rk3562, rk3566, rk3568, rk3576, rk3588, rv1126b]")
+        exit(1)
+
+    model_path = sys.argv[1]
+    platform = sys.argv[2]
+
+    do_quant = DEFAULT_QUANT
+    if len(sys.argv) > 3:
+        model_type = sys.argv[3]
+        if model_type not in ['i8', 'u8', 'fp']:
+            print("ERROR: Invalid model type: {}".format(model_type))
+            exit(1)
+        elif model_type in ['i8', 'u8']:
+            do_quant = True
+        else:
+            do_quant = False
+
+    hybrid_step = 'hybrid-quant-step1'
+    if len(sys.argv) > 4 and do_quant:
+        step = sys.argv[4]
+        if step not in ['1', '2']:
+            print("ERROR: Invalid hybrid-quant step: {}".format(step))
+            exit(1)
+        hybrid_step = 'hybrid-quant-step1' if step == '1' else 'hybrid-quant-step2' 
+
+    if len(sys.argv) > 5:
+        output_path = sys.argv[5]
+    else:
+        output_path = DEFAULT_RKNN_PATH
+
+    return model_path, platform, do_quant, output_path, hybrid_step
+
+if __name__ == '__main__':
+    model_path, platform, do_quant, output_path, hybrid_step = parse_arg()
+
+    # Create RKNN object
+    rknn = RKNN(verbose=False)
+
+    # Pre-process config
+    print('--> Config model')
+
+    rknn.config(mean_values=[[0, 0, 0]], std_values=[
+                    [255, 255, 255]], target_platform=platform,
+			disable_rules=['seperate_conv_rs_split'])
+    print('done')
+
+    # Load model
+    ret = None 
+    print('--> Loading model')
+    if hybrid_step == 'hybrid-quant-step1' or do_quant == False:
+        ret = rknn.load_onnx(model=model_path)
+        if ret != 0:
+            print('Load model failed!')
+            exit(ret)
+    print('done')
+
+    # Build model
+    print('--> Building model')
+    if platform in ["rv1109","rv1126","rk1808"] :
+        ret = rknn.build(do_quantization=do_quant, dataset=DATASET_PATH, auto_hybrid_quant=True)
+    else:
+        if do_quant:
+            if hybrid_step == 'hybrid-quant-step1':
+                rknn.hybrid_quantization_step1(
+                    dataset=DATASET_PATH,
+                    proposal= False,
+                    custom_hybrid=[['/model.22/cv4.0/cv4.0.0/act/Mul_output_0','output0'],
+                                    ['/model.22/cv4.1/cv4.1.0/act/Mul_output_0','/model.22/Concat_6_output_0'],
+                                ['/model.22/cv4.2/cv4.2.0/act/Mul_output_0','/model.22/Concat_6_output_0']]
+                )
+            elif hybrid_step == 'hybrid-quant-step2':
+                model_name=os.path.basename(model_path).replace('.onnx','')
+                rknn.hybrid_quantization_step2(
+                    model_input  = model_name+".model",          # 表示第一步生成的模型文件
+                    data_input   = model_name+".data",             # 表示第一步生成的配置文件
+                    model_quantization_cfg=model_name+".quantization.cfg"  # 表示第一步生成的量化配置文件
+                )
+        else:
+            ret = rknn.build(do_quantization=do_quant, dataset=DATASET_PATH)
+            if ret != 0:
+                print('Build model failed!')
+                exit(ret)
+    print('done')
+
+    # Export rknn model
+    print('--> Export rknn model')
+    if do_quant and hybrid_step == 'hybrid-quant-step2':
+        ret = rknn.export_rknn(output_path)
+    elif do_quant == False:
+        ret = rknn.export_rknn(output_path)
+    if ret != 0:
+        print('Export rknn model failed!')
+        exit(ret)
+    print('done')
+    # Release
+    rknn.release()
