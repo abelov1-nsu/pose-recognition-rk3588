@@ -4,3 +4,6 @@ scikit-learn
 joblib
 tqdm
 rknn-toolkit-lite2
+ultralytics
+lap
+luma.oled
