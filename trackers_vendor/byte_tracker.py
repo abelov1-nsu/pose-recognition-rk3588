@@ -202,7 +202,7 @@ class STrack(BaseTrack):
     @property
     def result(self) -> list[float]:
         """Get the current tracking result as `[*box, track_id, score, cls, idx]`, with box in xyxy or xywha (OBB)."""
-        coords = self.xyxy if self.angle is None else self.xywha
+        coords = self[:, 4] if self.angle is None else self.xywha
         return [*coords.tolist(), self.track_id, self.score, self.cls, self.idx]
 
     def __repr__(self) -> str:
@@ -325,7 +325,7 @@ class BYTETracker:
             (tuple[Any, Any, np.ndarray, np.ndarray]): High-confidence results, low-confidence results, high mask, and
                 low mask.
         """
-        scores = results.conf
+        scores = results[:, 4]
         wh = (results.xywhr if hasattr(results, "xywhr") else results.xywh)[:, 2:4]
         valid = (wh[:, 0] > 0) & (wh[:, 1] > 0)  # tlwh_to_xyah divides by height, so h=0 would give an inf Kalman mean
         remain_inds = valid & (scores >= self.args.track_high_thresh)
@@ -372,7 +372,7 @@ class BYTETracker:
         """Hook called after Kalman predict, before first-stage assignment. Default: GMC if available."""
         if hasattr(self, "gmc") and self.gmc.method is not None and img is not None:
             try:
-                warp = self.gmc.apply(img, results_high.xyxy)
+                warp = self.gmc.apply(img, results_high[:, 4])
             except Exception as e:
                 LOGGER.warning(f"GMC failed, falling back to identity: {e}")
                 warp = np.eye(2, 3)
@@ -517,7 +517,7 @@ class BYTETracker:
         if len(results) == 0:
             return []
         bboxes = parse_bboxes(results)
-        return [self.track_class(xywh, s, c) for (xywh, s, c) in zip(bboxes, results.conf, results.cls)]
+        return [self.track_class(xywh, s, c) for (xywh, s, c) in zip(bboxes, results[:, 4], results.cls)]
 
     def get_dists(self, tracks: list[STrack], detections: list[STrack]) -> np.ndarray:
         """Calculate the distance between tracks and detections using IoU and optionally fuse scores."""

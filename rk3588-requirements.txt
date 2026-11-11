@@ -1,5 +1,5 @@
 rknn-toolkit-lite2
 numpy
 opencv-python
-ultralytics
+lap
 luma.oled
