@@ -46,10 +46,9 @@ try:
 except ImportError:
     mss = None
 
-# ultralytics is used ONLY for ByteTrack + NMS on CPU.
-# It does not load a PyTorch YOLO model in this script.
-from ultralytics.trackers.byte_tracker import BYTETracker
-from ultralytics.utils import IterableSimpleNamespace
+# ByteTrack + IterableSimpleNamespace are vendored locally
+# (trackers_vendor/) � no ultralytics / torch dependency at runtime.
+from ultralytics_compat import BYTETracker, IterableSimpleNamespace
 
 
 # ============================================================
@@ -162,8 +161,8 @@ def decode_yolov8_pose(outputs, img_w, img_h):
 
         out = out[0].transpose(1, 2, 0).reshape(-1, c)   # (H*W, 65)
         box_logits = out[:, :4 * REG_MAX]                # (HW, 64)
-        cls_logits = out[:, 4 * REG_MAX:5 * REG_MAX if False else 4 * REG_MAX + 1]
 
+        # cls_logits = out[:, 4 * REG_MAX:5 * REG_MAX if False else 4 * REG_MAX + 1]
         # Actually: layout is [64 box | 1 class]
         cls_logits = out[:, 4 * REG_MAX:]                # (HW, 1)
         score = _sigmoid(cls_logits[:, 0])
@@ -307,7 +306,13 @@ class PersonState:
         self.confidences.append(confidence)
         if not self.predictions:
             return
-        counts = np.bincount(list(self.predictions), minlength=len(classes))
+        
+        valid = [p for p in self.predictions if 0 <= p < len(classes)]
+        if not valid:
+            return
+        counts = np.bincount(valid, minlength=len(classes))
+        # counts = np.bincount(list(self.predictions), minlength=len(classes))
+        
         candidate = int(np.argmax(counts))
         confs = [c for p, c in zip(self.predictions, self.confidences) if p == candidate]
         self.stable_label = classes[candidate]
@@ -567,7 +572,12 @@ def main():
         for tid in expired:
             del person_states[tid]
 
-        if writer:
+        if len(person_states) > 64:
+            # Drop the least-recently-seen extra states
+            for tid in sorted(person_states, key=lambda k: person_states[k].last_seen)[:-64]:
+                del person_states[tid]
+
+        if writer:  
             writer.write(annotated)
 
         if not args.no_display:
